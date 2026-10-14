@@ -1,0 +1,18 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { calculateSpread, formatFreshness, formatPrice, getAssetClass } from '../utils/marketUtils';
+export const MarketCardGrid = ({ items, priceFlashes, onSelectSymbol, }) => {
+    return (_jsx("div", { className: "max-w-7xl mx-auto px-4 lg:px-8 mt-4", children: _jsx("div", { className: "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3.5 sm:gap-4", children: items.map((item) => {
+                const flash = priceFlashes[item.symbol];
+                const changePct = parseFloat(item.change_24h_pct);
+                const isPositive = !isNaN(changePct) && changePct > 0;
+                const isNegative = !isNaN(changePct) && changePct < 0;
+                const spread = calculateSpread(item.buy, item.sell);
+                const assetClass = getAssetClass(item.symbol);
+                return (_jsxs("div", { onClick: () => onSelectSymbol(item.symbol), className: `p-4 rounded-2xl bg-[#101520] border border-slate-800/80 shadow-lg shadow-black/20 hover:border-slate-700/80 transition-all cursor-pointer group ${flash === 'up' ? 'flash-up' : flash === 'down' ? 'flash-down' : ''}`, children: [_jsxs("div", { className: "flex items-center justify-between", children: [_jsxs("div", { children: [_jsx("h3", { className: "text-base font-bold text-white group-hover:text-cyan-300 transition-colors", children: item.symbol }), _jsx("span", { className: "text-[10px] text-slate-400", children: assetClass })] }), _jsxs("div", { className: `flex items-center gap-0.5 px-2 py-0.5 rounded-lg text-xs font-bold font-mono ${isPositive
+                                        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                        : isNegative
+                                            ? 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
+                                            : 'bg-slate-800 text-slate-400'}`, children: [isPositive ? _jsx(ArrowUpRight, { className: "w-3.5 h-3.5" }) : isNegative ? _jsx(ArrowDownRight, { className: "w-3.5 h-3.5" }) : null, _jsxs("span", { children: [isPositive ? '+' : '', changePct.toFixed(2), "%"] })] })] }), _jsxs("div", { className: "mt-3", children: [_jsx("span", { className: "text-xs text-slate-500 font-medium block", children: "Midpoint Price" }), _jsx("div", { className: "text-xl font-bold font-mono text-white tracking-tight", children: formatPrice(item.mid_price, item.symbol) })] }), _jsxs("div", { className: "mt-3 pt-2.5 border-t border-slate-800/60 grid grid-cols-2 gap-2 text-xs font-mono", children: [_jsxs("div", { children: [_jsx("span", { className: "text-[10px] text-slate-500 block", children: "Buy (Bid)" }), _jsx("span", { className: "text-emerald-400 font-medium", children: formatPrice(item.buy, item.symbol) })] }), _jsxs("div", { children: [_jsx("span", { className: "text-[10px] text-slate-500 block", children: "Sell (Ask)" }), _jsx("span", { className: "text-rose-400 font-medium", children: formatPrice(item.sell, item.symbol) })] })] }), _jsxs("div", { className: "mt-3 pt-2.5 border-t border-slate-800/60 flex items-center justify-between text-[11px] text-slate-400", children: [_jsxs("span", { className: "font-mono text-[10px] text-slate-500", children: ["H: ", formatPrice(item.high_24h, item.symbol)] }), _jsxs("span", { className: "flex items-center gap-1 font-mono text-[10px]", children: [_jsx("span", { className: `w-1.5 h-1.5 rounded-full ${item.is_stale ? 'bg-amber-400' : 'bg-emerald-400'}` }), item.is_stale ? 'Stale' : formatFreshness(item.freshness_ms)] })] })] }, item.symbol));
+            }) }) }));
+};
