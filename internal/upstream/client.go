@@ -40,6 +40,8 @@ type Client struct {
 	reconnectInitial time.Duration
 	reconnectMax     time.Duration
 	readTimeout      time.Duration
+	maxAuthRetries   int
+	authAttempts     int
 
 	mu             sync.Mutex
 	conn           *websocket.Conn
@@ -59,6 +61,7 @@ type ClientConfig struct {
 	ReconnectInitial time.Duration
 	ReconnectMax     time.Duration
 	ReadTimeout      time.Duration
+	MaxAuthRetries   int
 	Handler          RawTickHandler
 	Metrics          *metrics.Metrics
 	Logger           *slog.Logger
@@ -95,6 +98,7 @@ func NewClient(cfg ClientConfig) *Client {
 		reconnectInitial: cfg.ReconnectInitial,
 		reconnectMax:     cfg.ReconnectMax,
 		readTimeout:      cfg.ReadTimeout,
+		maxAuthRetries:   cfg.MaxAuthRetries,
 		stopCh:           make(chan struct{}),
 		ctx:              ctx,
 		cancel:           cancel,
@@ -151,12 +155,28 @@ func (c *Client) runLoop() {
 			return
 		}
 
-		// Check if it's an authentication error
-		if errors.Is(err, ErrAuthFailed) {
+		// Check if it's an authentication error or close code 4003 (invalid credentials)
+		if errors.Is(err, ErrAuthFailed) || isAuthCloseError(err) {
 			if c.metrics != nil {
 				c.metrics.IncAuthFailures()
 			}
-			c.logger.Error("upstream authentication failed, halting reconnect loop to prevent lockouts", "error", err)
+			c.authAttempts++
+			if c.authAttempts <= c.maxAuthRetries {
+				c.logger.Warn("upstream authentication failed, retrying per retry policy",
+					"attempt", c.authAttempts,
+					"max_retries", c.maxAuthRetries,
+					"error", err)
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(c.reconnectInitial):
+					continue
+				}
+			}
+
+			c.logger.Error("upstream authentication failed: invalid credentials or authorization failure (close code 4003). Please verify UPSTREAM_API_KEY and UPSTREAM_SECRET_KEY in your configuration. Halting reconnect loop to prevent account lockout.",
+				"error", err,
+				"attempts", c.authAttempts)
 			return
 		}
 
@@ -199,6 +219,9 @@ func (c *Client) connectAndStream() error {
 
 	conn, _, err := dialer.DialContext(c.ctx, c.url, nil)
 	if err != nil {
+		if isAuthCloseError(err) {
+			return fmt.Errorf("%w: dial failed with auth error: %v", ErrAuthFailed, err)
+		}
 		return fmt.Errorf("dial failed: %w", err)
 	}
 
@@ -224,8 +247,11 @@ func (c *Client) connectAndStream() error {
 		c.logger.Info("no upstream credentials configured, proceeding without auth")
 	}
 
-	// 2. Subscribe to symbols
+	// 2. Subscribe to symbols ONLY after validated authentication
 	if err := c.subscribe(conn); err != nil {
+		if isAuthCloseError(err) {
+			return fmt.Errorf("%w: subscription failed with auth close: %v", ErrAuthFailed, err)
+		}
 		return fmt.Errorf("subscription failed: %w", err)
 	}
 
@@ -233,7 +259,7 @@ func (c *Client) connectAndStream() error {
 	return c.readLoop(conn)
 }
 
-// authenticate sends credentials and awaits auth response.
+// authenticate sends credentials and awaits auth response according to the provider protocol.
 func (c *Client) authenticate(conn *websocket.Conn) error {
 	authMsg := map[string]interface{}{
 		"action":  "auth",
@@ -243,6 +269,9 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := conn.WriteJSON(authMsg); err != nil {
+		if isAuthCloseError(err) {
+			return fmt.Errorf("%w: failed to send auth payload due to close code 4003: %v", ErrAuthFailed, err)
+		}
 		return fmt.Errorf("failed to send auth payload: %w", err)
 	}
 
@@ -250,27 +279,114 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
+		if isAuthCloseError(err) {
+			return fmt.Errorf("%w: auth response read failed with close code 4003: %v", ErrAuthFailed, err)
+		}
 		return fmt.Errorf("failed to read auth response: %w", err)
 	}
 
-	// Log response message without leaking credentials
 	c.logger.Info("received auth response from upstream", "bytes", len(msg))
 
-	// Check if auth response contains failure indicators
+	if err := validateAuthResponse(msg); err != nil {
+		return err
+	}
+
+	c.logger.Info("upstream authentication verified successfully")
+	return nil
+}
+
+// validateAuthResponse parses and verifies the upstream authentication response JSON.
+// Never assumes success based only on receiving a response.
+func validateAuthResponse(msg []byte) error {
 	var resp map[string]interface{}
-	if err := json.Unmarshal(msg, &resp); err == nil {
-		if status, ok := resp["status"].(string); ok {
-			statusLower := strings.ToLower(status)
-			if statusLower == "error" || statusLower == "failed" || statusLower == "unauthorized" {
-				return fmt.Errorf("%w: response status '%s'", ErrAuthFailed, status)
+	if err := json.Unmarshal(msg, &resp); err != nil {
+		return fmt.Errorf("%w: invalid json in auth response: %v", ErrAuthFailed, err)
+	}
+
+	// 1. Check explicit failure indicators
+	// Check "event" field errors (e.g. {"event":"error","message":"invalid credentials"})
+	if event, ok := resp["event"].(string); ok {
+		eventLower := strings.ToLower(event)
+		if eventLower == "error" || eventLower == "failed" || eventLower == "rejected" {
+			errMsg := "authentication rejected"
+			if m, ok := resp["message"].(string); ok && m != "" {
+				errMsg = m
+			} else if m, ok := resp["error"].(string); ok && m != "" {
+				errMsg = m
 			}
-		}
-		if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
-			return fmt.Errorf("%w: %s", ErrAuthFailed, errMsg)
+			return fmt.Errorf("%w: %s (event: %s)", ErrAuthFailed, errMsg, event)
 		}
 	}
 
-	c.logger.Info("upstream authentication successful")
+	// Check "status" field errors
+	if status, ok := resp["status"].(string); ok {
+		statusLower := strings.ToLower(status)
+		if statusLower == "error" || statusLower == "failed" || statusLower == "unauthorized" || statusLower == "rejected" {
+			errMsg := "authentication rejected"
+			if m, ok := resp["error"].(string); ok && m != "" {
+				errMsg = m
+			} else if m, ok := resp["message"].(string); ok && m != "" {
+				errMsg = m
+			}
+			return fmt.Errorf("%w: %s (status: %s)", ErrAuthFailed, errMsg, status)
+		}
+	}
+
+	// Check top-level "error" field
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return fmt.Errorf("%w: %s", ErrAuthFailed, errMsg)
+	}
+
+	// Check status code
+	if code, ok := resp["code"].(float64); ok && code >= 400 {
+		return fmt.Errorf("%w: status code %d", ErrAuthFailed, int(code))
+	}
+
+	// Check explicit boolean flags
+	if auth, ok := resp["authenticated"].(bool); ok && !auth {
+		return fmt.Errorf("%w: authenticated flag is false", ErrAuthFailed)
+	}
+	if succ, ok := resp["success"].(bool); ok && !succ {
+		return fmt.Errorf("%w: success flag is false", ErrAuthFailed)
+	}
+
+	// 2. Validate confirmation of success (never assume success blindly)
+	isSuccess := false
+	if status, ok := resp["status"].(string); ok {
+		statusLower := strings.ToLower(status)
+		if statusLower == "success" || statusLower == "ok" || statusLower == "authenticated" || statusLower == "connected" {
+			isSuccess = true
+		}
+	}
+	if event, ok := resp["event"].(string); ok {
+		eventLower := strings.ToLower(event)
+		if eventLower == "authenticated" || eventLower == "success" || eventLower == "ok" {
+			isSuccess = true
+		}
+	}
+	if auth, ok := resp["authenticated"].(bool); ok && auth {
+		isSuccess = true
+	}
+	if succ, ok := resp["success"].(bool); ok && succ {
+		isSuccess = true
+	}
+	if action, ok := resp["action"].(string); ok && strings.EqualFold(action, "auth") {
+		if st, ok := resp["status"].(string); ok {
+			stLower := strings.ToLower(st)
+			if stLower == "success" || stLower == "ok" {
+				isSuccess = true
+			}
+		}
+	}
+
+	if !isSuccess {
+		keys := make([]string, 0, len(resp))
+		for k := range resp {
+			keys = append(keys, k)
+		}
+		return fmt.Errorf("%w: response does not confirm authentication success (received keys: %v)", ErrAuthFailed, keys)
+	}
+
 	return nil
 }
 
@@ -283,6 +399,9 @@ func (c *Client) subscribe(conn *websocket.Conn) error {
 
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := conn.WriteJSON(subMsg); err != nil {
+		if isAuthCloseError(err) {
+			return fmt.Errorf("%w: subscription write failed with close code 4003: %v", ErrAuthFailed, err)
+		}
 		return fmt.Errorf("write subscribe error: %w", err)
 	}
 
@@ -302,6 +421,9 @@ func (c *Client) readLoop(conn *websocket.Conn) error {
 		_ = conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
+			if isAuthCloseError(err) {
+				return fmt.Errorf("%w: upstream connection closed with code 4003 (invalid credentials): %v", ErrAuthFailed, err)
+			}
 			return fmt.Errorf("read error: %w", err)
 		}
 
@@ -309,18 +431,37 @@ func (c *Client) readLoop(conn *websocket.Conn) error {
 			continue
 		}
 
-		// Inspect message structure
-		// Could be a single RawTick or an array of RawTicks
+		// 1. Inspect control messages / error events from upstream
+		var ctrl map[string]interface{}
+		if err := json.Unmarshal(message, &ctrl); err == nil {
+			if ev, ok := ctrl["event"].(string); ok && strings.EqualFold(ev, "error") {
+				msgText := "upstream error"
+				if m, ok := ctrl["message"].(string); ok {
+					msgText = m
+				}
+				if strings.Contains(strings.ToLower(msgText), "credentials") || strings.Contains(strings.ToLower(msgText), "authenticate") {
+					return fmt.Errorf("%w: upstream stream rejected with auth error: %s", ErrAuthFailed, msgText)
+				}
+				c.logger.Warn("upstream reported error event", "message", msgText)
+				continue
+			}
+			if act, ok := ctrl["action"].(string); ok && (act == "subscribe" || act == "pong" || act == "heartbeat") {
+				continue
+			}
+		}
+
+		// 2. Try single RawTick
 		var single market.RawTick
-		if err := json.Unmarshal(message, &single); err == nil && single.Symbol != "" {
+		if err := json.Unmarshal(message, &single); err == nil && single.Symbol != "" && len(single.Buy) > 0 {
 			if c.handler != nil {
 				c.handler(c.ctx, single)
 			}
 			continue
 		}
 
+		// 3. Try array of RawTicks
 		var batch []market.RawTick
-		if err := json.Unmarshal(message, &batch); err == nil && len(batch) > 0 {
+		if err := json.Unmarshal(message, &batch); err == nil && len(batch) > 0 && batch[0].Symbol != "" {
 			if c.handler != nil {
 				for _, tick := range batch {
 					c.handler(c.ctx, tick)
@@ -328,5 +469,61 @@ func (c *Client) readLoop(conn *websocket.Conn) error {
 			}
 			continue
 		}
+
+		// 4. Try envelope wrappers (e.g., {"data": ...} or {"ticks": ...})
+		var envelope struct {
+			Data   json.RawMessage `json:"data"`
+			Ticks  json.RawMessage `json:"ticks"`
+			Prices json.RawMessage `json:"prices"`
+		}
+		if err := json.Unmarshal(message, &envelope); err == nil {
+			payload := envelope.Data
+			if len(payload) == 0 {
+				payload = envelope.Ticks
+			}
+			if len(payload) == 0 {
+				payload = envelope.Prices
+			}
+
+			if len(payload) > 0 {
+				var envSingle market.RawTick
+				if err := json.Unmarshal(payload, &envSingle); err == nil && envSingle.Symbol != "" {
+					if c.handler != nil {
+						c.handler(c.ctx, envSingle)
+					}
+					continue
+				}
+
+				var envBatch []market.RawTick
+				if err := json.Unmarshal(payload, &envBatch); err == nil && len(envBatch) > 0 {
+					if c.handler != nil {
+						for _, tick := range envBatch {
+							c.handler(c.ctx, tick)
+						}
+					}
+					continue
+				}
+			}
+		}
+
+		c.logger.Debug("unhandled upstream message format", "bytes", len(message))
 	}
+}
+
+// isAuthCloseError checks if an error represents close code 4003, 4000, or credential failure.
+func isAuthCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		if closeErr.Code == 4003 || closeErr.Code == 4000 {
+			return true
+		}
+	}
+	if websocket.IsCloseError(err, 4003, 4000) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "4003") || strings.Contains(errStr, "invalid credentials")
 }

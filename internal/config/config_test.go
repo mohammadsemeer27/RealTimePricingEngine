@@ -2,16 +2,17 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestConfigLoadDefaults(t *testing.T) {
-	// Clear any env variables that might affect the test
 	os.Unsetenv("HTTP_PORT")
 	os.Unsetenv("UPSTREAM_WS_URL")
 	os.Unsetenv("UPSTREAM_API_KEY")
 	os.Unsetenv("UPSTREAM_SECRET_KEY")
+	os.Unsetenv("UPSTREAM_USE_MOCK")
 
 	cfg, err := Load()
 	if err != nil {
@@ -27,18 +28,50 @@ func TestConfigLoadDefaults(t *testing.T) {
 	if cfg.WebSocket.MaxConnections != 1000 {
 		t.Errorf("expected max connections 1000, got %d", cfg.WebSocket.MaxConnections)
 	}
+	if !cfg.Upstream.UseMock {
+		t.Errorf("expected UseMock to default to true when no API keys are present")
+	}
 }
 
-func TestConfigValidation(t *testing.T) {
+func TestConfigValidationRealModeMissingCredentials(t *testing.T) {
 	cfg := &Config{
-		HTTPPort: 99999, // Invalid port
+		HTTPPort: 8080,
+		Upstream: UpstreamConfig{
+			URL:       "wss://v3-prod.livefxhub.com/ws/algo",
+			UseMock:   false, // Real mode
+			APIKey:    "",
+			SecretKey: "",
+		},
 		WebSocket: WebSocketConfig{
 			MaxConnections:  100,
 			ClientQueueSize: 10,
 		},
 	}
-	if err := cfg.Validate(); err == nil {
-		t.Errorf("expected validation error for invalid port, got nil")
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected error when UPSTREAM_USE_MOCK=false without credentials, got nil")
+	}
+	if !strings.Contains(err.Error(), "UPSTREAM_API_KEY and UPSTREAM_SECRET_KEY must be provided") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestConfigValidationRealModeWithCredentials(t *testing.T) {
+	cfg := &Config{
+		HTTPPort: 8080,
+		Upstream: UpstreamConfig{
+			URL:       "wss://v3-prod.livefxhub.com/ws/algo",
+			UseMock:   false,
+			APIKey:    "test_key",
+			SecretKey: "test_secret",
+		},
+		WebSocket: WebSocketConfig{
+			MaxConnections:  100,
+			ClientQueueSize: 10,
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid configuration with credentials, got: %v", err)
 	}
 }
 
@@ -59,23 +92,10 @@ func TestConfigRedactedString(t *testing.T) {
 	}
 
 	redacted := cfg.RedactedString()
-	if contains(redacted, "super_secret_api_key") || contains(redacted, "super_secret_private_key") {
+	if strings.Contains(redacted, "super_secret_api_key") || strings.Contains(redacted, "super_secret_private_key") {
 		t.Fatalf("redacted string leaked credentials: %s", redacted)
 	}
-	if !contains(redacted, "[REDACTED]") {
+	if !strings.Contains(redacted, "[REDACTED]") {
 		t.Fatalf("redacted string missing [REDACTED] placeholder: %s", redacted)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 || (len(s) > 0 && containsSubstr(s, substr)))
-}
-
-func containsSubstr(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

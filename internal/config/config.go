@@ -58,8 +58,24 @@ type DatabaseConfig struct {
 
 // Load reads configuration from the environment and optional .env file.
 func Load() (*Config, error) {
-	// Attempt to load .env if it exists in the current directory
+	// Attempt to load .env from current directory or parent directory
 	loadDotEnv(".env")
+	loadDotEnv("../.env")
+
+	// Determine if mock is explicitly set
+	useMockVal, mockSpecified := os.LookupEnv("UPSTREAM_USE_MOCK")
+	var useMock bool
+	if mockSpecified {
+		parsed, err := strconv.ParseBool(strings.TrimSpace(useMockVal))
+		if err == nil {
+			useMock = parsed
+		} else {
+			useMock = false
+		}
+	} else {
+		// If not explicitly set, default to mock only if API key is absent
+		useMock = (getEnv("UPSTREAM_API_KEY", "") == "")
+	}
 
 	cfg := &Config{
 		HTTPPort: getEnvInt("HTTP_PORT", 8080),
@@ -68,7 +84,7 @@ func Load() (*Config, error) {
 			URL:              getEnv("UPSTREAM_WS_URL", "wss://v3-prod.livefxhub.com/ws/algo"),
 			APIKey:           getEnv("UPSTREAM_API_KEY", ""),
 			SecretKey:        getEnv("UPSTREAM_SECRET_KEY", ""),
-			UseMock:          getEnvBool("UPSTREAM_USE_MOCK", false),
+			UseMock:          useMock,
 			ReconnectInitial: time.Duration(getEnvInt("UPSTREAM_RECONNECT_INITIAL_MS", 500)) * time.Millisecond,
 			ReconnectMax:     time.Duration(getEnvInt("UPSTREAM_RECONNECT_MAX_MS", 30000)) * time.Millisecond,
 			ReadTimeout:      time.Duration(getEnvInt("UPSTREAM_READ_TIMEOUT_MS", 15000)) * time.Millisecond,
@@ -110,6 +126,9 @@ func (c *Config) Validate() error {
 	if !c.Upstream.UseMock {
 		if c.Upstream.URL == "" {
 			return fmt.Errorf("UPSTREAM_WS_URL cannot be empty when mock is disabled")
+		}
+		if c.Upstream.APIKey == "" || c.Upstream.SecretKey == "" {
+			return fmt.Errorf("UPSTREAM_API_KEY and UPSTREAM_SECRET_KEY must be provided when UPSTREAM_USE_MOCK=false")
 		}
 	}
 	if c.WebSocket.MaxConnections <= 0 {
@@ -179,9 +198,10 @@ func loadDotEnv(filepath string) {
 		if len(parts) == 2 {
 			k := strings.TrimSpace(parts[0])
 			v := strings.TrimSpace(parts[1])
-			// Strip surrounding quotes if present
 			v = strings.Trim(v, `"'`)
-			if _, exists := os.LookupEnv(k); !exists {
+			// Set if not set or currently empty
+			existing, exists := os.LookupEnv(k)
+			if !exists || strings.TrimSpace(existing) == "" {
 				_ = os.Setenv(k, v)
 			}
 		}

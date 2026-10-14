@@ -56,6 +56,8 @@ func NewPostgresStore(ctx context.Context, cfg config.DatabaseConfig, m *metrics
 	poolConfig.MaxConns = int32(cfg.MaxOpenConns)
 	poolConfig.MinConns = int32(cfg.MaxIdleConns)
 	poolConfig.MaxConnLifetime = cfg.ConnMaxLifetime
+	poolConfig.MaxConnIdleTime = 1 * time.Minute
+	poolConfig.HealthCheckPeriod = 15 * time.Second
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
@@ -225,10 +227,16 @@ func (ps *PostgresStore) batchFlushWorker() {
 			if ps.metrics != nil {
 				ps.metrics.IncDatabaseErrors()
 			}
-		} else {
-			if ps.metrics != nil {
-				ps.metrics.IncDatabaseWrites(uint64(len(batch)))
+			// Retain batch so ticks are not dropped on transient error, capped to prevent OOM
+			if len(batch) > 5000 {
+				ps.logger.Warn("persistence batch exceeded safe cap, pruning oldest", "cap", 5000)
+				batch = batch[len(batch)-2500:]
 			}
+			return
+		}
+
+		if ps.metrics != nil {
+			ps.metrics.IncDatabaseWrites(uint64(len(batch)))
 		}
 		batch = batch[:0]
 	}
@@ -263,7 +271,7 @@ func (ps *PostgresStore) batchFlushWorker() {
 }
 
 func (ps *PostgresStore) persistBatch(ticks []market.Tick) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	rows := make([][]interface{}, len(ticks))

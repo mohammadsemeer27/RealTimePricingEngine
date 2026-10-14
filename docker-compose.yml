@@ -37,13 +37,16 @@ services:
       - DB_ENABLE_PERSISTENCE=true
       - DB_BATCH_SIZE=100
       - DB_FLUSH_INTERVAL_MS=200
-      - UPSTREAM_USE_MOCK=${UPSTREAM_USE_MOCK:-true}
+      - UPSTREAM_USE_MOCK=${UPSTREAM_USE_MOCK:-false}
       - UPSTREAM_WS_URL=${UPSTREAM_WS_URL:-wss://v3-prod.livefxhub.com/ws/algo}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
       - UPSTREAM_SECRET_KEY=${UPSTREAM_SECRET_KEY:-}
       - WS_MAX_CONNECTIONS=1000
       - WS_CLIENT_QUEUE_SIZE=256
       - WS_ENABLE_COMPRESSION=true
+    env_file:
+      - path: .env
+        required: false
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
       interval: 10s

@@ -99,6 +99,8 @@ func main() {
 		logger.Info("running with built-in mock upstream feed")
 		mockServer = upstream.NewMockServer(upstream.WithMockTickInterval(100 * time.Millisecond))
 		upstreamURL = mockServer.URL()
+	} else {
+		logger.Info("running with REAL upstream feed", "url", upstreamURL)
 	}
 
 	upstreamClient := upstream.NewClient(upstream.ClientConfig{
