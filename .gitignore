@@ -1,0 +1,46 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/server
+
+# Architecture / Object files
+*.o
+*.a
+
+# Test binary, cover profiles, benchmark files
+*.test
+*.out
+coverage.html
+profile.pprof
+
+# Environment and secrets
+.env
+*.env
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Docker / Postgres volumes
+data/
+pgdata/
+tmp/
+scratch/

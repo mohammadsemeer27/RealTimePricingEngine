@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pricing-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pricing_user
+      POSTGRES_PASSWORD: pricing_pass
+      POSTGRES_DB: pricing_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pricing_user -d pricing_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pricing-network
+
+  pricing-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pricing-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      - HTTP_PORT=8080
+      - LOG_LEVEL=info
+      - DATABASE_URL=postgres://pricing_user:pricing_pass@postgres:5432/pricing_db?sslmode=disable
+      - DB_ENABLE_PERSISTENCE=true
+      - DB_BATCH_SIZE=100
+      - DB_FLUSH_INTERVAL_MS=200
+      - UPSTREAM_USE_MOCK=${UPSTREAM_USE_MOCK:-true}
+      - UPSTREAM_WS_URL=${UPSTREAM_WS_URL:-wss://v3-prod.livefxhub.com/ws/algo}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
+      - UPSTREAM_SECRET_KEY=${UPSTREAM_SECRET_KEY:-}
+      - WS_MAX_CONNECTIONS=1000
+      - WS_CLIENT_QUEUE_SIZE=256
+      - WS_ENABLE_COMPRESSION=true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    stop_signal: SIGTERM
+    stop_grace_period: 15s
+    networks:
+      - pricing-network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  pricing-network:
+    driver: bridge

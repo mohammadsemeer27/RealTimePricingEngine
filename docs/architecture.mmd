@@ -1,0 +1,74 @@
+flowchart TD
+    subgraph Upstream["Upstream Feed (LiveFXHub / Mock)"]
+        U1["LiveFXHub WebSocket Feed<br/>(wss://v3-prod.livefxhub.com/ws/algo)"]
+        U2["Mock Upstream Server<br/>(Built-in Test & Dev Stream)"]
+    end
+
+    subgraph UpstreamClient["Upstream Ingestion Layer"]
+        C1["Upstream Client<br/>(Single-flight Reconnection)"]
+        C2["Authentication Handler<br/>(Action: auth, No Credential Leaks)"]
+        C3["Subscription Handler<br/>(60 Canonical Symbols)"]
+        C4["Deadlines & Jitter Backoff<br/>(Exponential Backoff + Jitter)"]
+    end
+
+    subgraph ProcessingPipeline["Market Processing Engine"]
+        P1["Parser & Validator<br/>(JSON, Crossed Market & Clock Drift Checks)"]
+        P2["Controllable Clock & Deduplication<br/>(Drops Identical & Stale Ticks)"]
+        P3["Rolling 24h Window<br/>(Monotonic Deques: O(1) Min & Max)"]
+        P4["Independent 24h Stats<br/>(Midpoint, High, Low, % Change)"]
+    end
+
+    subgraph PersistenceLayer["PostgreSQL Persistence & Recovery"]
+        DB1[("PostgreSQL 16 Pool<br/>(pgxpool, max 25 conns)")]
+        DB2["Asynchronous Batched Copy<br/>(pgx.CopyFrom, 100 rows / 200ms)"]
+        DB3["Startup State Recovery<br/>(Restores <= 24h Observations)"]
+        DB4["Schema Migrations<br/>(schema_migrations table)"]
+    end
+
+    subgraph DownstreamDistribution["Downstream Distribution Layer"]
+        H1["WebSocket Hub<br/>(Subscription Registry & Connection Limits)"]
+        H2["Single Writer Pump<br/>(Bounded Queues, Write Deadlines)"]
+        H3["Payload Optimizer<br/>(Compact Deltas & Compression < 10 KB)"]
+        H4["Slow-Client Protection<br/>(Non-blocking Buffer Overflow Drop)"]
+        WSC["Downstream Clients<br/>(/ws Subscribers)"]
+    end
+
+    subgraph Observability["REST API & Metrics"]
+        A1["GET /healthz<br/>(Process Liveness)"]
+        A2["GET /readyz<br/>(Database Dependency Check)"]
+        A3["GET /prices & /prices/{symbol}<br/>(Market Snapshots)"]
+        A4["GET /metrics<br/>(Prometheus & JSON Observability)"]
+    end
+
+    %% Data Flow Connections
+    U1 -.->|TLS WebSocket| C1
+    U2 -.->|Local WebSocket| C1
+    C1 --> C2
+    C2 --> C3
+    C3 --> C4
+    C4 -->|Raw Ticks| P1
+
+    P1 -->|Validated Tick| P2
+    P2 -->|Strictly Causal Ticks| P3
+    P3 --> P4
+
+    %% Persistence Flow
+    P4 -.->|Enqueues Tick| DB2
+    DB2 -->|Batched Multi-row Write| DB1
+    DB1 -.->|Startup Hydration| DB3
+    DB3 -->|Rebuilds Deques| P3
+    DB4 -->|Applies Schema| DB1
+
+    %% Distribution Flow
+    P4 -->|Computed Snapshot| H1
+    H1 --> H3
+    H3 --> H2
+    H2 --> H4
+    H4 -->|Compact Deltas| WSC
+
+    %% API & Metrics
+    P4 -.->|State Query| A3
+    DB1 -.->|Ping Check| A2
+    P1 -.->|Metrics Ticks/Latency| A4
+    H1 -.->|Client Counts| A4
+    DB2 -.->|DB Latency/Errors| A4
